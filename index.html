@@ -23,6 +23,9 @@ li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top:
 li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 small { color: var(--soft); white-space: nowrap; }
 a.save { background: var(--blue); color: #fff; text-decoration: none; padding: 6px 14px; border-radius: 16px; font-weight: 500; }
+form { display: flex; gap: 8px; margin-top: 14px; }
+form button { margin-top: 0; background: var(--blue); border-color: var(--blue); color: #fff; }
+input { flex: 1; min-width: 0; font: inherit; font-size: 16px; padding: 8px 12px; border-radius: 12px; border: 1px solid var(--line); background: none; color: var(--ink); }
 button { margin-top: 14px; font: inherit; padding: 8px 16px; border-radius: 18px; border: 1px solid var(--line); background: none; color: var(--ink); }
 [hidden] { display: none !important; }
 footer { margin-top: 14px; font-size: 12px; color: var(--soft); }
@@ -32,6 +35,7 @@ footer { margin-top: 14px; font-size: 12px; color: var(--soft); }
 <main>
   <h1 id="title"></h1>
   <p id="status"></p>
+  <form id="lock" hidden><input id="word" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" aria-labelledby="status"><button id="openIt"></button></form>
   <div id="bar" hidden><i></i></div>
   <ul id="list"></ul>
   <button id="again" hidden></button>
@@ -46,6 +50,7 @@ const say = french ? {
   noway: "Connexion impossible entre ces deux réseaux. Essayez sur un autre réseau, ou le Wi-Fi au lieu des données mobiles.",
   old: "Ce navigateur ne peut pas recevoir directement.", again: "Réessayer", save: "Enregistrer",
   note: "Le fichier arrive directement de l’autre appareil, chiffré. Il reste dans ce navigateur jusqu’à ce que vous l’enregistriez.",
+  askWord: "Ce fichier demande un mot de passe.", openIt: "Ouvrir", wrongWord: "Ce mot de passe ne l’ouvre pas. Réessayez.", opening: "Ouverture…",
   space: "Pas assez de place sur cet appareil pour ce fichier.", uploading: "L’envoi n’est pas terminé, le fichier arrive…", downloading: "Téléchargement…", doneStored: "Terminé.",
   gone: "Ce lien a expiré, ou l’envoi n’a pas commencé.", stuck: "L’envoi s’est arrêté avant la fin. Demandez à nouveau le fichier.", broken: "Ce fichier ne peut pas être déverrouillé avec ce lien.",
   noteStored: until => `Chiffré avant de quitter l’appareil de l’expéditeur : seul ce lien l’ouvre. Disponible jusqu’au ${until}. Il reste dans ce navigateur jusqu’à ce que vous l’enregistriez.`
@@ -55,6 +60,7 @@ const say = french ? {
   noway: "These two networks could not connect. Try another network, or Wi-Fi instead of mobile data.",
   old: "This browser cannot receive directly.", again: "Try again", save: "Save",
   note: "The file comes straight from the other device, encrypted. It stays in this browser until you save it.",
+  askWord: "This file needs a password.", openIt: "Open", wrongWord: "That password does not open it. Try again.", opening: "Opening…",
   space: "Not enough room on this device for this file.", uploading: "Still being uploaded, it is on its way…", downloading: "Downloading…", doneStored: "Done.",
   gone: "This link has expired, or the upload has not started.", stuck: "The upload stopped before the end. Ask for the file again.", broken: "This file cannot be unlocked with this link.",
   noteStored: until => `Encrypted before it left the sender's device: only this link opens it. Available until ${until}. It stays in this browser until you save it.`
@@ -64,6 +70,7 @@ $("title").textContent = say.title;
 $("note").textContent = say.note;
 $("again").textContent = say.again;
 $("again").onclick = () => location.reload();
+$("openIt").textContent = say.openIt;
 document.documentElement.lang = french ? "fr" : "en";
 const tell = (text, problem) => { $("status").textContent = text; $("status").className = problem ? "problem" : ""; };
 const stop = text => { tell(text, true); $("again").hidden = false; sockets.forEach(s => { try { s.close(); } catch {} }); clearInterval(repeat); };
@@ -134,30 +141,68 @@ async function newSink() {
 // A link that works with the sender's device closed: an ordinary download of sealed pieces.
 const WAIT_START_MS = 30000, WAIT_PIECE_MS = 600000, TRIES = 6;
 const pause = ms => new Promise(done => setTimeout(done, ms));
-async function fromStore(store, secret) {
+const nonce = number => {
+  const iv = new Uint8Array(12);
+  new DataView(iv.buffer).setBigUint64(4, BigInt(number));
+  return iv;
+};
+const hex = data => Array.from(data, b => b.toString(16).padStart(2, "0")).join("");
+const typedWord = () => new Promise(done => {
+  $("lock").hidden = false;
+  $("word").value = "";
+  $("word").focus();
+  $("lock").onsubmit = event => { event.preventDefault(); $("lock").hidden = true; done($("word").value); };
+});
+// The same as the Mac's, or nothing opens. The password never leaves this device.
+async function lockKey(secret, word) {
+  let stretched = new Uint8Array(0);
+  if (word !== null) {
+    const base = await crypto.subtle.importKey("raw", bytes(word.normalize("NFC")), "PBKDF2", false, ["deriveBits"]);
+    const salt = await sha(join(bytes("SwiftAgent lock salt"), secret));
+    stretched = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: 600000 }, base, 256));
+  }
+  const key = await sha(join(join(bytes("SwiftAgent lock key"), secret), stretched));
+  return crypto.subtle.importKey("raw", key, "AES-GCM", false, ["decrypt"]);
+}
+const unseal = (key, number, data) => crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce(number), additionalData: bytes("SwiftAgent piece") }, key, data);
+
+async function fromStore(store, secret, locked) {
   if (!crypto.subtle) return tell(say.old, true);
   tell(say.connecting);
-  const place = Array.from((await sha(join(bytes("SwiftAgent store place"), secret))).slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
-  const key = await crypto.subtle.importKey("raw", await sha(join(bytes("SwiftAgent store key"), secret)), "AES-GCM", false, ["decrypt"]);
-  const piece = async (number, patience) => {
+  const fetched = async (place, number, patience, waiting) => {
     const started = Date.now();
     for (let failed = 0;;) {
       let response;
       try { response = await fetch(`${store}/f/${place}/${number}`, { cache: "no-store", referrerPolicy: "no-referrer" }); }
       catch { if (++failed >= TRIES) throw say.ended; await pause(1000 * failed); continue; }
-      if (response.ok) {
-        const iv = new Uint8Array(12);
-        new DataView(iv.buffer).setBigUint64(4, BigInt(number));
-        try { return await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: bytes("SwiftAgent piece") }, key, await response.arrayBuffer()); }
-        catch { throw say.broken; }
-      }
+      if (response.ok) return response.arrayBuffer();
       if (response.status !== 404) { if (++failed >= TRIES) throw say.ended; await pause(1000 * failed); continue; }
-      if (Date.now() - started > patience) throw number ? say.stuck : say.gone;
+      if (Date.now() - started > patience) throw waiting;
       if (number) tell(say.uploading);
       await pause(3000);
     }
   };
-  const head = JSON.parse(new TextDecoder().decode(await piece(0, WAIT_START_MS)));
+  const lockPlace = hex((await sha(join(bytes("SwiftAgent store place"), secret))).slice(0, 16));
+  const sealedLock = await fetched(lockPlace, 0, WAIT_START_MS, say.gone);
+  let inside;
+  while (!inside) {
+    let word = null;
+    if (locked) {
+      tell(window.triedWord ? say.wrongWord : say.askWord, Boolean(window.triedWord));
+      word = await typedWord();
+      window.triedWord = true;
+      tell(say.opening);
+    }
+    try { inside = JSON.parse(new TextDecoder().decode(await unseal(await lockKey(secret, word), 0, sealedLock))); }
+    catch { if (!locked) throw say.broken; }
+  }
+  const place = inside.place;
+  const key = await crypto.subtle.importKey("raw", unb64(inside.key), "AES-GCM", false, ["decrypt"]);
+  const piece = async (number, patience) => {
+    const data = await fetched(place, number, patience, say.stuck);
+    try { return await unseal(key, number, data); } catch { throw say.broken; }
+  };
+  const head = JSON.parse(new TextDecoder().decode(await piece(0, WAIT_PIECE_MS)));
   const total = head.files.reduce((sum, f) => sum + f.size, 0);
   $("note").textContent = say.noteStored(new Date(head.until * 1000).toLocaleDateString(french ? "fr" : "en", { day: "numeric", month: "long" }));
   $("bar").hidden = false;
@@ -189,7 +234,7 @@ async function main() {
   if (fields.get("key") && fields.get("store")) {
     const secret = unlink(fields.get("key"));
     if (!secret || !/^https?:\/\//.test(fields.get("store"))) return tell(say.nolink, true);
-    return fromStore(fields.get("store"), secret).catch(problem => { tell(typeof problem === "string" ? problem : say.ended, true); $("again").hidden = false; });
+    return fromStore(fields.get("store"), secret, fields.get("locked") === "1").catch(problem => { tell(typeof problem === "string" ? problem : say.ended, true); $("again").hidden = false; });
   }
   const secret = unlink(location.hash.slice(1));
   if (!secret) return tell(say.nolink, true);
