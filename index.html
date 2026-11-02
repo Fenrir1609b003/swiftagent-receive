@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src wss: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src wss: https: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
 <title>Receive files</title>
 <style>
 :root { color-scheme: light dark; --ink: #1d1d1f; --soft: #6e6e73; --paper: #f5f5f7; --card: #fff; --line: #d2d2d7; --blue: #0071e3; --red: #d70015; }
@@ -45,13 +45,19 @@ const say = french ? {
   done: "Terminé. Rien n’est passé par un serveur.", nolink: "Ce lien est incomplet. Demandez-le à nouveau.", ended: "La connexion a été perdue.",
   noway: "Connexion impossible entre ces deux réseaux. Essayez sur un autre réseau, ou le Wi-Fi au lieu des données mobiles.",
   old: "Ce navigateur ne peut pas recevoir directement.", again: "Réessayer", save: "Enregistrer",
-  note: "Le fichier arrive directement de l’autre appareil, chiffré. Il reste dans ce navigateur jusqu’à ce que vous l’enregistriez."
+  note: "Le fichier arrive directement de l’autre appareil, chiffré. Il reste dans ce navigateur jusqu’à ce que vous l’enregistriez.",
+  space: "Pas assez de place sur cet appareil pour ce fichier.", uploading: "L’envoi n’est pas terminé, le fichier arrive…", downloading: "Téléchargement…", doneStored: "Terminé.",
+  gone: "Ce lien a expiré, ou l’envoi n’a pas commencé.", stuck: "L’envoi s’est arrêté avant la fin. Demandez à nouveau le fichier.", broken: "Ce fichier ne peut pas être déverrouillé avec ce lien.",
+  noteStored: until => `Chiffré avant de quitter l’appareil de l’expéditeur : seul ce lien l’ouvre. Disponible jusqu’au ${until}. Il reste dans ce navigateur jusqu’à ce que vous l’enregistriez.`
 } : {
   title: "Receive files", connecting: "Connecting to the other device…", waiting: "Waiting for the other device…", receiving: "Receiving…",
   done: "Done. Nothing went through a server.", nolink: "This link is incomplete. Ask for it again.", ended: "The connection was lost.",
   noway: "These two networks could not connect. Try another network, or Wi-Fi instead of mobile data.",
   old: "This browser cannot receive directly.", again: "Try again", save: "Save",
-  note: "The file comes straight from the other device, encrypted. It stays in this browser until you save it."
+  note: "The file comes straight from the other device, encrypted. It stays in this browser until you save it.",
+  space: "Not enough room on this device for this file.", uploading: "Still being uploaded, it is on its way…", downloading: "Downloading…", doneStored: "Done.",
+  gone: "This link has expired, or the upload has not started.", stuck: "The upload stopped before the end. Ask for the file again.", broken: "This file cannot be unlocked with this link.",
+  noteStored: until => `Encrypted before it left the sender's device: only this link opens it. Available until ${until}. It stays in this browser until you save it.`
 };
 const $ = id => document.getElementById(id);
 $("title").textContent = say.title;
@@ -76,11 +82,117 @@ const unb64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
 const size = n => n < 1e6 ? Math.max(1, Math.round(n / 1e3)) + " KB" : n < 1e9 ? (n / 1e6).toFixed(1) + " MB" : (n / 1e9).toFixed(2) + " GB";
 const randomName = () => Array.from(crypto.getRandomValues(new Uint8Array(20)), b => "abcdefghijklmnopqrstuvwxyz"[b % 26]).join("");
 
+const addRow = (file, saved) => {
+  const row = document.createElement("li");
+  const name = document.createElement("span"); name.textContent = file.name;
+  const weight = document.createElement("small"); weight.textContent = size(file.size);
+  const save = document.createElement("a"); save.className = "save"; save.textContent = say.save; save.href = URL.createObjectURL(saved); save.download = file.name;
+  row.append(name, weight, save);
+  $("list").append(row);
+  (window.saved = window.saved || []).push({ name: file.name, saved });
+};
+
+// On this device's disk where the browser allows it, as gigabytes in memory would end the page.
+const WRITE_BYTES = 4 << 20;
+const privateFolder = async () => { try { return await navigator.storage.getDirectory(); } catch { return null; } };
+async function clearOldFiles() {
+  const folder = await privateFolder();
+  if (!folder || !folder.keys) return;
+  try { for await (const name of folder.keys()) await folder.removeEntry(name).catch(() => {}); } catch {}
+}
+async function newSink() {
+  const folder = await privateFolder();
+  let out, handle;
+  try {
+    handle = await folder.getFileHandle(randomName(), { create: true });
+    out = await handle.createWritable();
+  } catch { out = null; }
+  const parts = [];
+  let waiting = [], waitingBytes = 0;
+  const flush = async () => {
+    if (!waitingBytes) return;
+    const piece = new Blob(waiting);
+    waiting = []; waitingBytes = 0;
+    if (!out) return parts.push(piece);
+    try { await out.write(piece); } catch { throw say.space; }
+  };
+  return {
+    add: async data => {
+      waiting.push(data);
+      waitingBytes += data.byteLength;
+      if (waitingBytes >= WRITE_BYTES) await flush();
+    },
+    end: async () => {
+      await flush();
+      if (!out) return new Blob(parts);
+      try { await out.close(); } catch { throw say.space; }
+      return handle.getFile();
+    },
+  };
+}
+
+// A link that works with the sender's device closed: an ordinary download of sealed pieces.
+const WAIT_START_MS = 30000, WAIT_PIECE_MS = 600000, TRIES = 6;
+const pause = ms => new Promise(done => setTimeout(done, ms));
+async function fromStore(store, secret) {
+  if (!crypto.subtle) return tell(say.old, true);
+  tell(say.connecting);
+  const place = Array.from((await sha(join(bytes("SwiftAgent store place"), secret))).slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
+  const key = await crypto.subtle.importKey("raw", await sha(join(bytes("SwiftAgent store key"), secret)), "AES-GCM", false, ["decrypt"]);
+  const piece = async (number, patience) => {
+    const started = Date.now();
+    for (let failed = 0;;) {
+      let response;
+      try { response = await fetch(`${store}/f/${place}/${number}`, { cache: "no-store", referrerPolicy: "no-referrer" }); }
+      catch { if (++failed >= TRIES) throw say.ended; await pause(1000 * failed); continue; }
+      if (response.ok) {
+        const iv = new Uint8Array(12);
+        new DataView(iv.buffer).setBigUint64(4, BigInt(number));
+        try { return await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: bytes("SwiftAgent piece") }, key, await response.arrayBuffer()); }
+        catch { throw say.broken; }
+      }
+      if (response.status !== 404) { if (++failed >= TRIES) throw say.ended; await pause(1000 * failed); continue; }
+      if (Date.now() - started > patience) throw number ? say.stuck : say.gone;
+      if (number) tell(say.uploading);
+      await pause(3000);
+    }
+  };
+  const head = JSON.parse(new TextDecoder().decode(await piece(0, WAIT_START_MS)));
+  const total = head.files.reduce((sum, f) => sum + f.size, 0);
+  $("note").textContent = say.noteStored(new Date(head.until * 1000).toLocaleDateString(french ? "fr" : "en", { day: "numeric", month: "long" }));
+  $("bar").hidden = false;
+  let number = 0, got = 0;
+  for (const file of head.files) {
+    const sink = await newSink();
+    for (let index = 0; index < file.pieces; index++) {
+      const plain = await piece(++number, WAIT_PIECE_MS);
+      tell(say.downloading);
+      await sink.add(plain);
+      got += plain.byteLength;
+      window.progress = got;
+      $("bar").firstElementChild.style.width = (total ? got / total * 100 : 100) + "%";
+    }
+    addRow(file, await sink.end());
+  }
+  $("bar").hidden = true;
+  tell(say.doneStored);
+  window.received = head.files.map(f => f.name);
+}
+
+const unlink = text => {
+  try { const secret = unb64(text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - text.length % 4) % 4)); return secret.length === 16 ? secret : null; } catch { return null; }
+};
+
 async function main() {
-  const text = location.hash.slice(1).replace(/-/g, "+").replace(/_/g, "/");
-  let secret;
-  try { secret = unb64(text + "=".repeat((4 - text.length % 4) % 4)); } catch {}
-  if (!secret || secret.length !== 16) return tell(say.nolink, true);
+  await clearOldFiles();
+  const fields = new URLSearchParams(location.hash.slice(1));
+  if (fields.get("key") && fields.get("store")) {
+    const secret = unlink(fields.get("key"));
+    if (!secret || !/^https?:\/\//.test(fields.get("store"))) return tell(say.nolink, true);
+    return fromStore(fields.get("store"), secret).catch(problem => { tell(typeof problem === "string" ? problem : say.ended, true); $("again").hidden = false; });
+  }
+  const secret = unlink(location.hash.slice(1));
+  if (!secret) return tell(say.nolink, true);
   if (!window.RTCPeerConnection || !crypto.subtle) return tell(say.old, true);
   tell(say.connecting);
 
@@ -136,21 +248,16 @@ async function main() {
 
 let started = false;
 function receive(channel, pc) {
-  let files = [], at = 0, parts = [], got = 0, total = 0, doneBytes = 0, finished = false;
+  let files = [], at = 0, sink = null, got = 0, total = 0, doneBytes = 0, finished = false, turn = Promise.resolve();
   channel.onopen = () => { started = true; sockets.forEach(s => { try { s.close(); } catch {} }); channel.send("ready"); };
-  const nextFile = () => {
-    while (at < files.length && got === files[at].size) {
-      const file = files[at];
-      const url = URL.createObjectURL(new Blob(parts));
-      const row = document.createElement("li");
-      const name = document.createElement("span"); name.textContent = file.name;
-      const weight = document.createElement("small"); weight.textContent = size(file.size);
-      const save = document.createElement("a"); save.className = "save"; save.textContent = say.save; save.href = url; save.download = file.name;
-      row.append(name, weight, save);
-      $("list").append(row);
-      parts = []; got = 0; at += 1;
+  const nextFile = async () => {
+    while (at < files.length) {
+      if (!sink) sink = await newSink();
+      if (got !== files[at].size) return;
+      addRow(files[at], await sink.end());
+      sink = null; got = 0; at += 1;
     }
-    if (at === files.length && files.length && !finished) {
+    if (files.length && !finished) {
       finished = true;
       channel.send("done");
       tell(say.done);
@@ -158,22 +265,24 @@ function receive(channel, pc) {
       window.received = files.map(f => f.name);
     }
   };
-  channel.onmessage = event => {
-    if (typeof event.data === "string") {
-      files = JSON.parse(event.data).files;
+  const heard = async data => {
+    if (typeof data === "string") {
+      files = JSON.parse(data).files;
       total = files.reduce((sum, f) => sum + f.size, 0);
       tell(say.receiving);
       $("bar").hidden = false;
       return nextFile();
     }
-    parts.push(event.data);
-    got += event.data.byteLength;
-    doneBytes += event.data.byteLength;
+    await sink.add(data);
+    got += data.byteLength;
+    doneBytes += data.byteLength;
     $("bar").firstElementChild.style.width = (total ? doneBytes / total * 100 : 100) + "%";
     window.progress = doneBytes;
-    nextFile();
+    await nextFile();
   };
-  channel.onclose = () => { if (!finished) stop(say.ended); };
+  // Writing to disk takes time, and the pieces must stay in order.
+  channel.onmessage = event => { turn = turn.then(() => heard(event.data)).catch(problem => stop(typeof problem === "string" ? problem : say.ended)); };
+  channel.onclose = () => { turn.then(() => { if (!finished) stop(say.ended); }); };
   pc.onconnectionstatechange = () => { if (pc.connectionState === "failed" && !finished) stop(started ? say.ended : say.noway); };
 }
 main().catch(error => stop(String(error && error.message || error)));
