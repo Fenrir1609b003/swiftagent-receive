@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src wss: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<title>Receive files</title>
+<style>
+:root { color-scheme: light dark; --ink: #1d1d1f; --soft: #6e6e73; --paper: #f5f5f7; --card: #fff; --line: #d2d2d7; --blue: #0071e3; --red: #d70015; }
+@media (prefers-color-scheme: dark) { :root { --ink: #f5f5f7; --soft: #a1a1a6; --paper: #000; --card: #1c1c1e; --line: #38383a; --blue: #2997ff; --red: #ff453a; } }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100dvh; display: grid; place-items: center; padding: 16px; background: var(--paper); color: var(--ink);
+       font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; }
+main { width: min(420px, 100%); background: var(--card); border-radius: 18px; padding: 22px; box-shadow: 0 1px 3px rgba(0,0,0,.08), 0 10px 30px rgba(0,0,0,.06); }
+h1 { font-size: 19px; font-weight: 600; margin: 0 0 4px; }
+p { margin: 0; color: var(--soft); }
+p.problem { color: var(--red); }
+#bar { height: 6px; border-radius: 3px; background: var(--line); margin: 16px 0 4px; overflow: hidden; }
+#bar i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .2s; }
+ul { list-style: none; margin: 14px 0 0; padding: 0; }
+li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+small { color: var(--soft); white-space: nowrap; }
+a.save { background: var(--blue); color: #fff; text-decoration: none; padding: 6px 14px; border-radius: 16px; font-weight: 500; }
+button { margin-top: 14px; font: inherit; padding: 8px 16px; border-radius: 18px; border: 1px solid var(--line); background: none; color: var(--ink); }
+[hidden] { display: none !important; }
+footer { margin-top: 14px; font-size: 12px; color: var(--soft); }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title"></h1>
+  <p id="status"></p>
+  <div id="bar" hidden><i></i></div>
+  <ul id="list"></ul>
+  <button id="again" hidden></button>
+  <footer id="note"></footer>
+</main>
+<script>
+"use strict";
+const french = (navigator.language || "").toLowerCase().startsWith("fr");
+const say = french ? {
+  title: "Recevoir des fichiers", connecting: "Connexion à l’autre appareil…", waiting: "En attente de l’autre appareil…", receiving: "Réception…",
+  done: "Terminé. Rien n’est passé par un serveur.", nolink: "Ce lien est incomplet. Demandez-le à nouveau.", ended: "La connexion a été perdue.",
+  noway: "Connexion impossible entre ces deux réseaux. Essayez sur un autre réseau, ou le Wi-Fi au lieu des données mobiles.",
+  old: "Ce navigateur ne peut pas recevoir directement.", again: "Réessayer", save: "Enregistrer",
+  note: "Le fichier arrive directement de l’autre appareil, chiffré. Il reste dans ce navigateur jusqu’à ce que vous l’enregistriez."
+} : {
+  title: "Receive files", connecting: "Connecting to the other device…", waiting: "Waiting for the other device…", receiving: "Receiving…",
+  done: "Done. Nothing went through a server.", nolink: "This link is incomplete. Ask for it again.", ended: "The connection was lost.",
+  noway: "These two networks could not connect. Try another network, or Wi-Fi instead of mobile data.",
+  old: "This browser cannot receive directly.", again: "Try again", save: "Save",
+  note: "The file comes straight from the other device, encrypted. It stays in this browser until you save it."
+};
+const $ = id => document.getElementById(id);
+$("title").textContent = say.title;
+$("note").textContent = say.note;
+$("again").textContent = say.again;
+$("again").onclick = () => location.reload();
+document.documentElement.lang = french ? "fr" : "en";
+const tell = (text, problem) => { $("status").textContent = text; $("status").className = problem ? "problem" : ""; };
+const stop = text => { tell(text, true); $("again").hidden = false; sockets.forEach(s => { try { s.close(); } catch {} }); clearInterval(repeat); };
+const sockets = [];
+let repeat;
+
+const BOARDS = ["wss://tracker.openwebtorrent.com", "wss://tracker.webtorrent.dev", "wss://tracker.files.fm:7073/announce"];
+const ADDRESS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }];
+const CONNECT_MS = 30000;
+
+const bytes = text => new TextEncoder().encode(text);
+const join = (a, b) => { const out = new Uint8Array(a.length + b.length); out.set(a); out.set(b, a.length); return out; };
+const sha = async data => new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+const b64 = data => btoa(String.fromCharCode(...data));
+const unb64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
+const size = n => n < 1e6 ? Math.max(1, Math.round(n / 1e3)) + " KB" : n < 1e9 ? (n / 1e6).toFixed(1) + " MB" : (n / 1e9).toFixed(2) + " GB";
+const randomName = () => Array.from(crypto.getRandomValues(new Uint8Array(20)), b => "abcdefghijklmnopqrstuvwxyz"[b % 26]).join("");
+
+async function main() {
+  const text = location.hash.slice(1).replace(/-/g, "+").replace(/_/g, "/");
+  let secret;
+  try { secret = unb64(text + "=".repeat((4 - text.length % 4) % 4)); } catch {}
+  if (!secret || secret.length !== 16) return tell(say.nolink, true);
+  if (!window.RTCPeerConnection || !crypto.subtle) return tell(say.old, true);
+  tell(say.connecting);
+
+  const room = Array.from((await sha(join(bytes("SwiftAgent room"), secret))).slice(0, 10), b => b.toString(16).padStart(2, "0")).join("");
+  const key = await crypto.subtle.importKey("raw", await sha(join(bytes("SwiftAgent seal"), secret)), "AES-GCM", false, ["encrypt", "decrypt"]);
+  const seal = async (plain, label) => {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const out = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: bytes(label) }, key, bytes(plain)));
+    return b64(join(iv, out));
+  };
+  const open = async (sealed, label) => {
+    const all = unb64(sealed);
+    return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: all.slice(0, 12), additionalData: bytes(label) }, key, all.slice(12)));
+  };
+
+  const pc = new RTCPeerConnection({ iceServers: ADDRESS });
+  const channel = pc.createDataChannel("files", { negotiated: true, id: 0, ordered: true });
+  channel.binaryType = "arraybuffer";
+  receive(channel, pc);
+  await pc.setLocalDescription(await pc.createOffer());
+  await new Promise(done => {
+    if (pc.iceGatheringState === "complete") return done();
+    pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState === "complete" && done());
+    setTimeout(done, 3000);
+  });
+
+  const offer = await seal(pc.localDescription.sdp, "offer");
+  const me = randomName(), offerId = randomName();
+  let answered = false;
+  const announce = socket => socket.readyState === 1 && socket.send(JSON.stringify({
+    action: "announce", info_hash: room, peer_id: me, numwant: 5, uploaded: 0, downloaded: 0, left: 1,
+    offers: [{ offer_id: offerId, offer: { type: "offer", sdp: offer } }]
+  }));
+  for (const address of BOARDS) {
+    const socket = new WebSocket(address);
+    sockets.push(socket);
+    socket.onopen = () => announce(socket);
+    socket.onmessage = async event => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (answered || !message.answer || message.offer_id !== offerId) return;
+      let sdp;
+      try { sdp = await open(message.answer.sdp, "answer"); } catch { return; }
+      if (answered) return;
+      answered = true;
+      clearInterval(repeat);
+      await pc.setRemoteDescription({ type: "answer", sdp });
+      setTimeout(() => { if (channel.readyState !== "open" && !started) stop(say.noway); }, CONNECT_MS);
+    };
+  }
+  repeat = setInterval(() => { if (!answered) { tell(say.waiting); sockets.forEach(announce); } }, 3000);
+}
+
+let started = false;
+function receive(channel, pc) {
+  let files = [], at = 0, parts = [], got = 0, total = 0, doneBytes = 0, finished = false;
+  channel.onopen = () => { started = true; sockets.forEach(s => { try { s.close(); } catch {} }); channel.send("ready"); };
+  const nextFile = () => {
+    while (at < files.length && got === files[at].size) {
+      const file = files[at];
+      const url = URL.createObjectURL(new Blob(parts));
+      const row = document.createElement("li");
+      const name = document.createElement("span"); name.textContent = file.name;
+      const weight = document.createElement("small"); weight.textContent = size(file.size);
+      const save = document.createElement("a"); save.className = "save"; save.textContent = say.save; save.href = url; save.download = file.name;
+      row.append(name, weight, save);
+      $("list").append(row);
+      parts = []; got = 0; at += 1;
+    }
+    if (at === files.length && files.length && !finished) {
+      finished = true;
+      channel.send("done");
+      tell(say.done);
+      $("bar").hidden = true;
+      window.received = files.map(f => f.name);
+    }
+  };
+  channel.onmessage = event => {
+    if (typeof event.data === "string") {
+      files = JSON.parse(event.data).files;
+      total = files.reduce((sum, f) => sum + f.size, 0);
+      tell(say.receiving);
+      $("bar").hidden = false;
+      return nextFile();
+    }
+    parts.push(event.data);
+    got += event.data.byteLength;
+    doneBytes += event.data.byteLength;
+    $("bar").firstElementChild.style.width = (total ? doneBytes / total * 100 : 100) + "%";
+    window.progress = doneBytes;
+    nextFile();
+  };
+  channel.onclose = () => { if (!finished) stop(say.ended); };
+  pc.onconnectionstatechange = () => { if (pc.connectionState === "failed" && !finished) stop(started ? say.ended : say.noway); };
+}
+main().catch(error => stop(String(error && error.message || error)));
+</script>
+</body>
+</html>
